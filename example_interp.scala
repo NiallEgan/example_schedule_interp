@@ -7,41 +7,46 @@ trait Ast extends Dsl {
   type Dim = String
   type Env = Map[Dim, Rep[Int]]
 
-  class Func(f: (Rep[Int], Rep[Int]) => Rep[Int], dom: (Int, Int), vars: (Dim, Dim)) {
+  class Func(f: (Rep[Int], Rep[Int]) => Rep[Int], dom: (Int, Int), vars: (Dim, Dim),
+             inlined: Boolean) {
+    /*  f reperesents the atual computation to be done
+        dom is the domain over which the function should be computed
+        vars is the variables used in the function - these aren't automatically inferred
+        from f at the moment
+    */
+
+    // This is a rep of the array which will store the computed values of f.
+    // TODO: In reality, the size of this buffer should depend on where the storage node
+    // for this function is and the range of values the consumer uses,
+    // and we shouldn't generate it at all if inlined
     val buffer: Rep[Array[Array[Int]]] = New2DArray[Int](dom._2, dom._1)
-    // TODO: Below doesn't work as a way of keeping track of what's stored and what isn't.
-    // figure this out to implement compute nodes
-    private val val_in_buffer: Map[(Rep[Int], Rep[Int]), Boolean]= Map()
 
     private def eval(x: Rep[Int], y: Rep[Int]): Rep[Int] = {
-      if (val_in_buffer.getOrElse((x, y), false)) buffer(y, x)
-      else f(x, y)
+        // If f isn't inlined, then any valid schedules will have already
+        // computed f at x, y
+        if (inlined) f(x, y)
+        else buffer(y, x)
     }
 
     def apply(x: Rep[Int], y: Rep[Int]): Rep[Int] = eval(x, y)
 
-    def show(): Unit = {
-      println(buffer)
-    }
-
     def upper_bound(v: Dim): Int = {
+      // This returns the upper bound for a given variable (used for the loop bounds)
       if (v == vars._1) dom._1
       else if (v == vars._2) dom._2
       else throw new Exception("Unknown var")
     }
 
     def compute(env: Env): Rep[Int] = {
+      // Looks up the vars in the environment and then evaluates f there
       val x = env(vars._1)
       val y = env(vars._2)
-      eval(x, y)
-
+      f(x, y)
     }
 
     def store_in_buffer(v: Rep[Int], env: Env): Unit = {
       val x = env(vars._1)
       val y = env(vars._2)
-      println(f"Storing ($x, $y) in buffer")
-      val_in_buffer((x, y)) = true
       buffer(y, x) = v
     }
   }
@@ -49,6 +54,7 @@ trait Ast extends Dsl {
   sealed trait LoopType
   case object Sequential extends LoopType
   case object Unrolled extends LoopType
+  // TODO: Vectorized, parallelized
 
   sealed trait ScheduleNode
   case class LoopNode(variable: Dim, func: Func, children: List[ScheduleNode],
@@ -59,7 +65,45 @@ trait Ast extends Dsl {
 
 }
 
-trait Prog extends Ast with StagedScheduleCompiler {
+trait StagedScheduleInterpreter extends Ast  {
+  def evalSched(node: ScheduleNode, env: Env): Rep[Unit] =
+    node match {
+      case LoopNode(variable, func, children, loop_type) =>
+        loop_type match {
+          /* Here we generate a for loop for 'variable', finding its upper bound from func.
+             The value of the variable (a rep of an int or an actual int)
+             gets added to the env */
+          case Sequential =>
+            for (i <- (0 until func.upper_bound(variable)): Rep[Range]) {
+              for (child <- children) evalSched(child, env + (variable -> i))
+            }
+          case Unrolled =>
+            for (i <- 0 until func.upper_bound(variable)) {
+              for (child <- children) {
+                evalSched(child, env + (variable -> i))
+              }
+            }
+        }
+
+      case ComputeNode(func, children) => {
+        /* At a compute node, we compute f.func and store it.
+          TODO: if we computed f in a previous iteration, we need to skip over
+          it */
+        val v: Rep[Int] = func.compute(env)
+        func.store_in_buffer(v, env)
+        for (child <- children) {
+          evalSched(child, env)
+        }
+      }
+
+      case RootNode(children) => {
+        for (child <- children) evalSched(child, env)
+      }
+
+    }
+}
+
+trait Prog extends Ast with StagedScheduleInterpreter {
   def eval_im(useless: Rep[Unit]): Rep[Unit] = {
     // No storage nodes at the moment. This means that basically the default is
     // store_at_root()
@@ -67,11 +111,11 @@ trait Prog extends Ast with StagedScheduleCompiler {
     val y: Dim = "y"
 
     def f_func(x: Rep[Int], y: Rep[Int]): Rep[Int] = x + y
-    val f: Func = new Func(f_func, (5, 5), (x, y))
+    val f: Func = new Func(f_func, (5, 5), (x, y), true)
 
     def g_func(x: Rep[Int], y: Rep[Int]): Rep[Int] =
       (f(x, y) + f(x, y+1) + f(y+1, x) + f(x+1, y+1)) / 4
-    val g: Func = new Func(g_func, (4, 4), (x, y))
+    val g: Func = new Func(g_func, (4, 4), (x, y), false)
 
     // Default Halide schedule: f gets inlined */
 
@@ -109,38 +153,4 @@ object Func {
       codegen.emitSource(eval_im, "f", new java.io.PrintWriter(System.out))
     }
   }
-}
-
-
-trait StagedScheduleCompiler extends Ast  {
-  def evalSched(node: ScheduleNode, env: Env): Rep[Unit] =
-    node match {
-      case LoopNode(variable, func, children, loop_type) =>
-        loop_type match {
-          case Sequential =>
-            // TODO: Repetition here. Encode type of loop
-            for (i <- (0 until func.upper_bound(variable)): Rep[Range]) {
-              for (child <- children) evalSched(child, env + (variable -> i))
-            }
-          case Unrolled =>
-            for (i <- 0 to func.upper_bound(variable) - 1) {
-              for (child <- children) {
-                evalSched(child, env + (variable -> i))
-              }
-            }
-        }
-
-      case ComputeNode(func, children) => {
-        val v: Rep[Int] = func.compute(env)
-        func.store_in_buffer(v, env)
-        for (child <- children) {
-          evalSched(child, env)
-        }
-      }
-
-      case RootNode(children) => {
-        for (child <- children) evalSched(child, env)
-      }
-
-    }
 }
